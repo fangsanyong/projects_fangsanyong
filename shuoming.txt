@@ -1,0 +1,232 @@
+import os
+import numpy as np
+from matplotlib.patches import ConnectionPatch
+import matplotlib.pyplot as plt
+from PIL import Image
+from sklearn.decomposition import PCA
+
+import torch
+import torch.nn.functional as F
+import torchvision.transforms.functional as TF
+from tqdm import tqdm
+import urllib
+
+# ==============================
+# 配置：选择你要加载的模型路径
+# ==============================
+
+# 🔽 从这里选择你要使用的模型目录
+MODEL_PATH = "./allmodels/facebook/dinov3-vitl16-pretrain-lvd1689m"  # ✅ 默认加载 ViT-L/16
+
+# 其他可选模型路径（取消注释即可切换）
+# MODEL_PATH = "./allmodels/facebook/dinov3-vitb16-pretrain-lvd1689m"
+# MODEL_PATH = "./allmodels/facebook/dinov3-vits16-pretrain-lvd1689m"
+# MODEL_PATH = "./allmodels/facebook/dinov3-vith16plus-pretrain-lvd1689m"
+# MODEL_PATH = "./allmodels/facebook/dinov3-vit7b16-pretrain-lvd1689m"
+
+# ConvNeXt 模型
+# MODEL_PATH = "./allmodels-convnext/facebook/dinov3-convnext-large-pretrain-lvd1689m"
+# MODEL_PATH = "./allmodels-convnext/facebook/dinov3-convnext-base-pretrain-lvd1689m"
+
+# 卫星图像模型（注意：你下错了，应该是 sat493m）
+# MODEL_PATH = "./allmodels-sat/facebook/dinov3-vitl16-pretrain-sat493m"  # ❌ 你下成了 lvd1689m，要重新下
+
+# ==============================
+# 检查模型路径是否存在
+# ==============================
+if not os.path.exists(MODEL_PATH):
+    raise FileNotFoundError(f"模型路径不存在: {os.path.abspath(MODEL_PATH)}\n"
+                            "请检查路径是否正确，或重新下载。")
+
+print(f"✅ 正在从本地加载模型: {os.path.abspath(MODEL_PATH)}")
+
+# ==============================
+# 自动选择设备：优先使用 GPU (CUDA)，否则使用 CPU
+# ==============================
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"🚀 使用设备: {device}")
+
+# ==============================
+# 使用 transformers 加载模型
+# ==============================
+from transformers import AutoModel
+
+# 根据设备决定 dtype
+if device.type == "cuda":
+    torch_dtype = torch.float16
+    use_autocast = True
+else:
+    torch_dtype = torch.float32
+    use_autocast = False  # CPU 不支持 autocast with fp16
+
+# 加载模型（不使用 device_map，手动移动到设备）
+model = AutoModel.from_pretrained(
+    MODEL_PATH,
+    torch_dtype=torch_dtype,
+    output_hidden_states=False
+)
+
+model.to(device)
+model.eval()
+print(f"✅ 模型 {os.path.basename(MODEL_PATH)} 已成功加载！")
+print(f"🚀 模型运行设备: {next(model.parameters()).device}")
+
+
+################################################################################################### 加载数据
+# 设置文件夹路径
+data_dir = "./test_images_dense_sparse_matching"
+
+# 文件路径
+image_left_path = os.path.join(data_dir, "image_left.jpg")
+mask_left_path = os.path.join(data_dir, "image_left_fg.png")
+image_right_path = os.path.join(data_dir, "image_right.jpg")
+mask_right_path = os.path.join(data_dir, "image_right_fg.png")
+
+# 加载图像函数（从本地）
+def load_image_from_path(path: str) -> Image.Image:
+    return Image.open(path).convert("RGBA")  # 确保有 alpha 通道便于合成
+
+# 加载图像和掩码
+image_left = load_image_from_path(image_left_path)
+mask_left = load_image_from_path(mask_left_path)
+
+image_right = load_image_from_path(image_right_path)
+mask_right = load_image_from_path(mask_right_path)
+
+# 创建显示图
+plt.figure(figsize=(16, 8), dpi=300)
+
+for j, (image, mask) in enumerate([(image_left, mask_left), (image_right, mask_right)]):
+    # 提取前景：用 mask 作为 alpha 融合图像和 mask
+    foreground = Image.composite(image, Image.new('RGBA', image.size, (0,0,0,0)), mask)
+
+    # 创建背景 mask（反转 alpha）
+    mask_np = np.array(mask)
+    mask_np[:, :, 3] = 255 - mask_np[:, :, 3]  # 反转 alpha 通道
+    mask_bg = Image.fromarray(mask_np)
+    background = Image.composite(image, Image.new('RGBA', image.size, (0,0,0,0)), mask_bg)
+
+    # 准备显示的数据
+    data_to_show = [image, mask, foreground, background]
+    data_labels = ["Image", "Mask", "Foreground", "Background"]
+
+    for i in range(len(data_to_show)):
+        plt.subplot(2, len(data_to_show), 4 * j + i + 1)
+        if data_to_show[i].mode == 'RGBA' or data_to_show[i].mode == 'LA':
+            plt.imshow(data_to_show[i])
+        else:
+            plt.imshow(data_to_show[i].convert('RGB'))
+        plt.axis('off')
+        plt.title(data_labels[i], fontsize=12)
+
+# 保存结果图到本地
+output_path = "./results/result_dense_sparse_matching.png"
+plt.tight_layout()
+plt.savefig(output_path, dpi=300, bbox_inches='tight')
+plt.close()  # 关闭图像避免显示（尤其在无 GUI 环境）
+
+print(f"结果已保存至: {output_path}")
+
+
+############################# 数据转换
+PATCH_SIZE = 16
+IMAGE_SIZE = 768
+
+# quantization filter for the given patch size
+patch_quant_filter = torch.nn.Conv2d(1, 1, PATCH_SIZE, stride=PATCH_SIZE, bias=False)
+patch_quant_filter.weight.data.fill_(1.0 / (PATCH_SIZE * PATCH_SIZE))
+patch_quant_filter.to(device)  # 移动到设备
+
+
+# image resize transform to dimensions divisible by patch size
+def resize_transform(
+    mask_image: Image,
+    image_size: int = IMAGE_SIZE,
+    patch_size: int = PATCH_SIZE,
+) -> torch.Tensor:
+    w, h = mask_image.size
+    h_patches = int(image_size / patch_size)
+    w_patches = int((w * image_size) / (h * patch_size))
+    return TF.to_tensor(TF.resize(mask_image, (h_patches * patch_size, w_patches * patch_size)))
+
+
+################################ 特征抽取
+
+# examples of available DINOv3 models:
+MODEL_DINOV3_VITS = "dinov3_vits16"
+MODEL_DINOV3_VITSP = "dinov3_vits16plus"
+MODEL_DINOV3_VITB = "dinov3_vitb16"
+MODEL_DINOV3_VITL = "dinov3_vitl16"
+MODEL_DINOV3_VITHP = "dinov3_vith16plus"
+MODEL_DINOV3_VIT7B = "dinov3_vit7b16"
+
+# we take DINOv3 ViT-L
+MODEL_NAME = MODEL_DINOV3_VITL
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+MODEL_TO_NUM_LAYERS = {
+    MODEL_DINOV3_VITS: 12,
+    MODEL_DINOV3_VITSP: 12,
+    MODEL_DINOV3_VITB: 12,
+    MODEL_DINOV3_VITL: 24,
+    MODEL_DINOV3_VITHP: 32,
+    MODEL_DINOV3_VIT7B: 40,
+}
+
+n_layers = MODEL_TO_NUM_LAYERS[MODEL_NAME]
+
+patch_mask_values = []
+patch_features = []
+
+with torch.inference_mode():
+    for image, mask in tqdm([(image_left, mask_left), (image_right, mask_right)], desc="Processing images"):
+        # 处理 mask
+        mask = mask.split()[-1]  # 获取 alpha 通道
+        mask_resized = resize_transform(mask)
+        mask_resized = mask_resized.to(device)
+
+        # 应用 patch quantization
+        mask_quantized = patch_quant_filter(mask_resized).squeeze().detach().cpu()
+        patch_mask_values.append(mask_quantized)
+
+        # 处理图像
+        image = image.convert('RGB')
+        image_resized = resize_transform(image)
+        image_resized = TF.normalize(image_resized, mean=IMAGENET_MEAN, std=IMAGENET_STD)
+        image_resized = image_resized.unsqueeze(0).to(device)  # 移动到设备
+
+        # 使用 autocast（仅 GPU 支持）
+        if use_autocast:
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                feats = model.get_intermediate_layers(
+                    image_resized, n=range(n_layers), reshape=True, norm=True
+                )
+        else:
+            feats = model.get_intermediate_layers(
+                image_resized, n=range(n_layers), reshape=True, norm=True
+            )
+
+        # 取最后一层特征
+        feat_last = feats[-1].squeeze().detach().cpu()  # 移回 CPU 保存
+        patch_features.append(feat_last)
+
+(.venv) d:\dinov3-main>
+(.venv) d:\dinov3-main> d: && cd d:\dinov3-main && cmd /C "d:\dinov3-main\.venv\Scripts\python.exe c:\Users\ThinkBook\.vscode\extensions\ms-python.debugpy-2025.11.2025072901-win32-x64\bundled\libs\debugpy\launcher 56942 -- D:\dinov3-main\dense_sparse_matching.py "
+✅ 正在从本地加载模型: d:\dinov3-main\allmodels\facebook\dinov3-vitl16-pretrain-lvd1689m
+🚀 使用设备: cpu
+✅ 模型 dinov3-vitl16-pretrain-lvd1689m 已成功加载！
+🚀 模型运行设备: cpu
+结果已保存至: ./results/result_dense_sparse_matching.png
+Processing images:   0%|                                                                                                                                                      | 0/2 [00:00<?, ?it/s] 
+Traceback (most recent call last):
+  File "D:\dinov3-main\dense_sparse_matching.py", line 207, in <module>
+    feats = model.get_intermediate_layers(
+  File "d:\dinov3-main\.venv\lib\site-packages\torch\nn\modules\module.py", line 1962, in __getattr__
+    raise AttributeError(
+AttributeError: 'DINOv3ViTModel' object has no attribute 'get_intermediate_layers'
+
+(.venv) d:\dinov3-main>
+
+我要保持我现在模型加载的方式，请解决我的问题，我的模型已经下载好了是safetensors的方式，不是meta官网的模型，因为官网的模型下载不到了，同时要支持cpu和gpu自动的方式，所以这个代码只要修改这个问题就可以了，中文回答，请理解我的需求给出完整的代码

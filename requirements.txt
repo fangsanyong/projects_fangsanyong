@@ -1,0 +1,27 @@
+torch>=2.0.0
+torchvision>=0.15.0
+timm>=0.9.0
+numpy>=1.21.0
+matplotlib>=3.5.0
+scikit-learn>=1.0.0
+Pillow>=9.0.0
+tqdm>=4.60.0
+jupyter  # 可选：如果你用 Jupyter Notebook
+transformers
+# ftfy
+# omegaconf
+# regex
+# scikit-learn
+# submitit
+# termcolor
+# torch
+# torchmetrics
+# torchvision
+
+#src/Scripts/activate
+#pip install -r requirements.txt
+
+
+# pip install --upgrade pip
+# pip install git+https://github.com/huggingface/transformers.git
+#pip install accelerate -i https://pypi.tuna.tsinghua.edu.cn/simple
