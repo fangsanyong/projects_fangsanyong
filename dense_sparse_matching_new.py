@@ -12,7 +12,7 @@ from tqdm import tqdm
 # ==============================
 # 创建：创建结果保存路径
 # ==============================
-
+data_dir_test="./test_images_dense_sparse_matching"
 data_dir = "./results"
 # 如果目录不存在，则创建
 if not os.path.exists(data_dir):
@@ -72,10 +72,10 @@ print(f"🚀 模型运行设备: {next(model.parameters()).device}")
 # 加载数据
 # ==============================
 
-image_left_path = os.path.join(data_dir, "image_left.jpg")
-mask_left_path = os.path.join(data_dir, "image_left_fg.png")
-image_right_path = os.path.join(data_dir, "image_right.jpg")
-mask_right_path = os.path.join(data_dir, "image_right_fg.png")
+image_left_path = os.path.join(data_dir_test, "image_left.jpg")
+mask_left_path = os.path.join(data_dir_test, "image_left_fg.png")
+image_right_path = os.path.join(data_dir_test, "image_right.jpg")
+mask_right_path = os.path.join(data_dir_test, "image_right_fg.png")
 
 def load_image_from_path(path: str) -> Image.Image:
     return Image.open(path).convert("RGBA")
